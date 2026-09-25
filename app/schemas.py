@@ -261,3 +261,47 @@ class PlaybackPlanResponse(BaseModel):
     total_duration_ms: int = Field(
         ..., description="总播放时长：各块播放时长与块间静音之和（不超过 max_duration_ms）"
     )
+
+
+class CrosstalkReportRequest(BaseModel):
+    words: list[WordIn] = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="词序列（至多 2000 词）；允许乱序与交叠，仅逐词校验 end_ms >= start_ms",
+    )
+
+
+class CrosstalkSpeakerOut(BaseModel):
+    speaker: str
+    covered_ms: int = Field(
+        ..., description="发声覆盖总毫秒数：词区间并集时长，同一说话人重叠词只计一次"
+    )
+
+
+class CrosstalkSegmentOut(BaseModel):
+    index: int
+    start_ms: int
+    end_ms: int
+    duration_ms: int
+    speakers: list[str] = Field(
+        ..., description="该段同时发声的说话人（至少两人，按标识排序）"
+    )
+
+
+class CrosstalkPairOverlapOut(BaseModel):
+    speaker_a: str = Field(..., description="说话人对中标识较小者")
+    speaker_b: str = Field(..., description="说话人对中标识较大者")
+    overlap_ms: int = Field(..., description="该对同时发声的总毫秒数（> 0）")
+
+
+class CrosstalkReportResponse(BaseModel):
+    speakers: list[CrosstalkSpeakerOut] = Field(
+        ..., description="按标识排序的各说话人发声覆盖"
+    )
+    segments: list[CrosstalkSegmentOut] = Field(
+        ..., description="按时间升序的叠话区间（至少两人同时发声）；无叠话时为空数组"
+    )
+    pair_overlaps: list[CrosstalkPairOverlapOut] = Field(
+        ..., description="按说话人对排序的总重叠毫秒数；仅含 overlap_ms > 0 的对"
+    )

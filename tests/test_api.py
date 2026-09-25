@@ -883,5 +883,161 @@ class PlaybackPlanApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class CrosstalkReportApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 1000, "end_ms": 3000, "text": "没错", "speaker": "A"},  # 故意乱序
+        {"start_ms": 0, "end_ms": 2000, "text": "我觉得", "speaker": "A"},
+        {"start_ms": 1500, "end_ms": 2500, "text": "对对对", "speaker": "B"},
+        {"start_ms": 4000, "end_ms": 5000, "text": "下期再见", "speaker": "B"},
+    ]
+    # A 覆盖 [0,3000)；B 覆盖 [1500,2500) 与 [4000,5000)；叠话 [1500,2500)
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"words": self.WORDS}
+        payload.update(overrides)
+        return self.client.post("/crosstalk-report", json=payload)
+
+    def test_basic_crosstalk_report(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(
+            data["speakers"],
+            [
+                {"speaker": "A", "covered_ms": 3000},
+                {"speaker": "B", "covered_ms": 2000},
+            ],
+        )
+        self.assertEqual(
+            data["segments"],
+            [
+                {
+                    "index": 0,
+                    "start_ms": 1500,
+                    "end_ms": 2500,
+                    "duration_ms": 1000,
+                    "speakers": ["A", "B"],
+                }
+            ],
+        )
+        self.assertEqual(
+            data["pair_overlaps"],
+            [{"speaker_a": "A", "speaker_b": "B", "overlap_ms": 1000}],
+        )
+
+    def test_touching_endpoints_no_overlap(self):
+        words = [
+            {"start_ms": 0, "end_ms": 1000, "text": "甲", "speaker": "A"},
+            {"start_ms": 1000, "end_ms": 2000, "text": "乙", "speaker": "B"},
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["segments"], [])
+        self.assertEqual(data["pair_overlaps"], [])
+
+    def test_zero_duration_word_ignored(self):
+        words = self.WORDS + [
+            {"start_ms": 2000, "end_ms": 2000, "text": "呃", "speaker": "C"}
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(len(data["segments"]), 1)  # 不产生新叠话
+        self.assertEqual(
+            data["speakers"],
+            [
+                {"speaker": "A", "covered_ms": 3000},
+                {"speaker": "B", "covered_ms": 2000},
+                {"speaker": "C", "covered_ms": 0},
+            ],
+        )
+
+    def test_three_way_overlap_counts_three_pairs(self):
+        words = [
+            {"start_ms": 0, "end_ms": 3000, "text": "甲", "speaker": "A"},
+            {"start_ms": 1000, "end_ms": 4000, "text": "乙", "speaker": "B"},
+            {"start_ms": 2000, "end_ms": 5000, "text": "丙", "speaker": "C"},
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(
+            [(s["start_ms"], s["end_ms"], s["speakers"]) for s in data["segments"]],
+            [(1000, 2000, ["A", "B"]), (2000, 3000, ["A", "B", "C"]), (3000, 4000, ["B", "C"])],
+        )
+        self.assertEqual(
+            data["pair_overlaps"],
+            [
+                {"speaker_a": "A", "speaker_b": "B", "overlap_ms": 2000},
+                {"speaker_a": "A", "speaker_b": "C", "overlap_ms": 1000},
+                {"speaker_a": "B", "speaker_b": "C", "overlap_ms": 2000},
+            ],
+        )
+
+    def test_invalid_time_range(self):
+        words = [
+            {"start_ms": 0, "end_ms": 1000, "text": "甲", "speaker": "A"},
+            {"start_ms": 900, "end_ms": 500, "text": "乙", "speaker": "B"},
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "invalid_time_range")
+        self.assertEqual(err["word_index"], 1)
+
+    def test_too_many_speakers(self):
+        words = [
+            {
+                "start_ms": i * 100,
+                "end_ms": i * 100 + 50,
+                "text": "词",
+                "speaker": f"S{i:02d}",
+            }
+            for i in range(21)
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "too_many_speakers")
+        self.assertEqual(err["speaker_count"], 21)
+        # 20 名恰好在上限内
+        resp = self.post(words=words[:20])
+        self.assertEqual(resp.status_code, 200)
+
+    def test_words_count_out_of_range(self):
+        resp = self.post(words=[])
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        words = [
+            {"start_ms": i * 500, "end_ms": i * 500 + 400, "text": "字", "speaker": "A"}
+            for i in range(2001)
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        # 2000 词恰好在上限内
+        resp = self.post(words=words[:2000])
+        self.assertEqual(resp.status_code, 200)
+
+    def test_unordered_and_overlapping_accepted(self):
+        # 乱序与交叠在本接口合法（其他接口会拒绝）
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+
+    def test_segments_still_works(self):
+        words = [
+            {"start_ms": 0, "end_ms": 2000, "text": "第一句。", "speaker": "A"},
+            {"start_ms": 2000, "end_ms": 4000, "text": "第二句。", "speaker": "B"},
+        ]
+        resp = self.client.post("/segments", json={"words": words})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()

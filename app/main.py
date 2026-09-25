@@ -2,7 +2,7 @@
 POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐、
 POST /duplicate-passages 重复口播片段检测、POST /redact-preview 敏感短语
 遮罩预览、POST /trailer-plan 预告片片段组合、POST /playback-plan 播放变速
-规划服务。"""
+规划、POST /crosstalk-report 叠话统计报告服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .ad_breaks import optimal_ad_breaks
 from .chapter_align import align_chapters
+from .crosstalk_report import build_crosstalk_report
 from .duplicate_passages import find_duplicate_passages
 from .errors import DomainError
 from .playback_plan import plan_playback
@@ -19,6 +20,8 @@ from .schemas import (
     AdBreakResponse,
     ChapterAlignRequest,
     ChapterAlignResponse,
+    CrosstalkReportRequest,
+    CrosstalkReportResponse,
     DuplicatePassagesRequest,
     DuplicatePassagesResponse,
     PlaybackPlanRequest,
@@ -45,9 +48,11 @@ app = FastAPI(
     "检测词序列完全相同的重复口播片段，"
     "对命中敏感短语的字符生成逐字遮罩预览，"
     "在词区间不重叠与时长预算约束下组合必选说话人全覆盖的预告片片段，"
-    "并把连续同一说话人的词合并为语速块，在目标最长播放时长内选出"
-    "总变速代价最小的语速方案。",
-    version="1.7.0",
+    "把连续同一说话人的词合并为语速块，在目标最长播放时长内选出"
+    "总变速代价最小的语速方案，"
+    "并对允许乱序与交叠的词序列统计各说话人发声覆盖、"
+    "至少两人同时发声的叠话区间与各说话人对的总重叠毫秒数。",
+    version="1.8.0",
 )
 
 
@@ -78,7 +83,7 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "且 words 至多 2000 个；/trailer-plan 另需 1～20 个 candidates"
         "（每项含整数 start_word/end_word 与非负整数 score）、非负整数 "
         "budget_ms 与 1～3 个非空 required_speakers；/playback-plan 另需"
-        "非负整数 max_duration_ms",
+        "非负整数 max_duration_ms；/crosstalk-report 的 words 至多 2000 个",
         {"errors": exc.errors()},
     )
 
@@ -178,4 +183,14 @@ async def create_playback_plan(request: PlaybackPlanRequest):
         blocks=blocks,
         total_cost=total_cost,
         total_duration_ms=total_duration_ms,
+    )
+
+
+@app.post("/crosstalk-report", response_model=CrosstalkReportResponse)
+async def create_crosstalk_report(request: CrosstalkReportRequest):
+    speakers, segments, pair_overlaps = build_crosstalk_report(request.words)
+    return CrosstalkReportResponse(
+        speakers=speakers,
+        segments=segments,
+        pair_overlaps=pair_overlaps,
     )
