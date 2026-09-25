@@ -261,3 +261,37 @@ class PlaybackPlanResponse(BaseModel):
     total_duration_ms: int = Field(
         ..., description="总播放时长：各块播放时长与块间静音之和（不超过 max_duration_ms）"
     )
+
+
+class CrosstalkReportRequest(BaseModel):
+    words: list[WordIn] = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="词序列（至多 2000 词）；允许乱序与交叠，仅要求 end_ms 不早于 start_ms",
+    )
+
+
+class CrosstalkSegmentOut(BaseModel):
+    index: int
+    start_ms: int = Field(..., description="交叠片段起点（毫秒，含）")
+    end_ms: int = Field(..., description="交叠片段终点（毫秒，不含）")
+    speakers: list[str] = Field(
+        ..., description="该段内同时发声的说话人（按标识升序，至少 2 个）"
+    )
+
+
+class CrosstalkPairOut(BaseModel):
+    speakers: list[str] = Field(
+        ..., description="说话人对：按标识升序的 2 个说话人标识"
+    )
+    overlap_ms: int = Field(..., description="该对说话人同时发声的总毫秒数")
+
+
+class CrosstalkReportResponse(BaseModel):
+    segments: list[CrosstalkSegmentOut] = Field(
+        ..., description="按时间升序的多人同时发声片段；无交叠时为空数组"
+    )
+    pairs: list[CrosstalkPairOut] = Field(
+        ..., description="按说话人标识排序的说话人对总重叠毫秒数；无交叠时为空数组"
+    )

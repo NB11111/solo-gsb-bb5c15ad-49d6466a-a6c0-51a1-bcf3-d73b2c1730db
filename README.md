@@ -9,7 +9,9 @@
 逐字替换为 `█` 并回报每处命中位置，**预告片片段组合**接口，在词区间
 互不重叠与时长预算约束下选出必选说话人全覆盖、总评分最高的候选片段组合，
 以及**播放变速规划**接口，把连续同一说话人的词合并为语速块，在目标最长
-播放时长约束下选出总变速代价最小的语速方案。
+播放时长约束下选出总变速代价最小的语速方案，
+以及**多人交叠发声报告**接口，对允许乱序与交叠的词序列统计至少两人
+同时发声的片段，并汇总各说话人对的总重叠毫秒数。
 基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
@@ -29,6 +31,7 @@ docker compose up --build
 - 敏感短语遮罩预览接口：`POST http://localhost:8000/redact-preview`
 - 预告片片段组合接口：`POST http://localhost:8000/trailer-plan`
 - 播放变速规划接口：`POST http://localhost:8000/playback-plan`
+- 多人交叠发声报告接口：`POST http://localhost:8000/crosstalk-report`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -798,21 +801,93 @@ curl -s http://localhost:8000/playback-plan \
 }
 ```
 
+## 多人交叠发声报告：`POST /crosstalk-report`
+
+对允许**乱序与交叠**的词序列，按**左闭右开区间**统计各说话人的发声覆盖
+（同一说话人的重叠词只计一次），返回**至少两人同时发声**的片段，并汇总各
+说话人对的总重叠毫秒数。零时长词（`end_ms == start_ms`）不参与统计。
+
+服务地址：`POST http://localhost:8000/crosstalk-report`
+
+```json
+{
+  "words": [
+    {"start_ms": 1500, "end_ms": 3500, "text": "插话",   "speaker": "B"},
+    {"start_ms": 2500, "end_ms": 4000, "text": "继续讲", "speaker": "A"},
+    {"start_ms": 0,    "end_ms": 2000, "text": "开场白", "speaker": "A"},
+    {"start_ms": 3000, "end_ms": 3600, "text": "附和",   "speaker": "C"}
+  ]
+}
+```
+
+字段说明：`words` 与 `/segments` 的词结构相同（至多 **2000** 个），但**不要求
+按时间排列、允许跨说话人甚至同一说话人的词互相交叠**，仅要求每个词自身
+`end_ms >= start_ms`；不同说话人至多 **20** 个。
+
+### 统计规则
+
+1. **覆盖**：每个正时长词贡献一条 `[start_ms, end_ms)` 区间；某说话人当前
+   只要有任意一条区间覆盖即在发声，**同一说话人的重叠词只计一次**；
+2. **片段切分**：按活跃说话人集合的变化切分，仅保留活跃说话人 **≥ 2** 的
+   片段；**仅合并相邻且活跃集合相同**的片段，集合相同但中间隔着其他
+   片段（单人段或另一组多人段）时不合并；
+3. **说话人对总重叠**：每段时长计入活跃集合的每个无序说话人对——
+   **三人同时发声的时长分别计入三对**；`pairs` 按说话人标识排序，
+   没有交叠时 `segments` 与 `pairs` 均为空数组；
+4. **端点相接不计重叠**：前一个词在 t 时刻结束、后一个词在 t 时刻开始
+   不算同时发声（左闭右开）；
+5. `end_ms < start_ms` 返回 **422**（`invalid_time_range`，与其他接口
+   同一错误格式并携带 `word_index`）；不同说话人超过 20 个返回 **422**
+   （`too_many_speakers`，携带 `speaker_count`）；`words` 为空或超过 2000 个
+   返回 **422**（`invalid_request`）。
+
+### 响应示例（200）
+
+```json
+{
+  "segments": [
+    {"index": 0, "start_ms": 1500, "end_ms": 2000, "speakers": ["A", "B"]},
+    {"index": 1, "start_ms": 2500, "end_ms": 3000, "speakers": ["A", "B"]},
+    {"index": 2, "start_ms": 3000, "end_ms": 3500, "speakers": ["A", "B", "C"]},
+    {"index": 3, "start_ms": 3500, "end_ms": 3600, "speakers": ["A", "C"]}
+  ],
+  "pairs": [
+    {"speakers": ["A", "B"], "overlap_ms": 1500},
+    {"speakers": ["A", "C"], "overlap_ms": 600},
+    {"speakers": ["B", "C"], "overlap_ms": 500}
+  ]
+}
+```
+
+> `segments` 按时间升序，`index` 为 0-based 序号；每段 `speakers` 为该段内
+> 同时发声的说话人（按标识升序，至少 2 个）。上例输入故意乱序：A 的覆盖
+> 为 `[0,2000) ∪ [2500,4000)`、B 为 `[1500,3500)`、C 为 `[3000,3600)`；
+> 三人段 `[3000,3500)` 的 500ms 分别计入 AB、AC、BC 三对，故 AB 共
+> 500+500+500=1500ms，AC 共 500+100=600ms，BC 为 500ms。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/crosstalk-report \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":1500,"end_ms":3500,"text":"插话","speaker":"B"},{"start_ms":2500,"end_ms":4000,"text":"继续讲","speaker":"A"},{"start_ms":0,"end_ms":2000,"text":"开场白","speaker":"A"},{"start_ms":3000,"end_ms":3600,"text":"附和","speaker":"C"}]}'
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负） | `errors` |
-| `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个（`/duplicate-passages`、`/redact-preview`、`/crosstalk-report`）、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负） | `errors` |
+| `invalid_time_range` | 某个词 `end_ms < start_ms`（`/crosstalk-report` 同样适用，乱序与交叠本身不报错） | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
 | `infeasible_segmentation` | 不存在满足全部约束的分段 | `last_word_index` |
 | `infeasible_ad_breaks` | 不存在满足全部约束的插播方案 | `break_count`、`candidate_count` |
 | `lock_index_out_of_range` | 锁定词序号越界（含负数） | `word_index` |
 | `duplicate_lock` | 同一词序号被重复锁定 | `word_index` |
-| `too_many_speakers` | 候选说话人（原标注 ∪ 锁定值）超过 8 个 | `speaker_count` |
+| `too_many_speakers` | `/speaker-reconcile` 候选说话人（原标注 ∪ 锁定值）超过 8 个，或 `/crosstalk-report` 不同说话人超过 20 个 | `speaker_count` |
 | `infeasible_chapter_alignment` | 某章 cue 无命中，或无法组成满足间隔约束的完整章节方案 | 无命中时为 `chapter_index`；否则为 `chapter_count`、`min_gap_ms` |
 | `candidate_index_out_of_range` | 预告片候选词序号越界（含负数） | `candidate_index` |
 | `candidate_range_inverted` | 预告片候选 `start_word > end_word` | `candidate_index` |
@@ -924,6 +999,14 @@ O(H) 空间**（H 为各章命中候选总数）。每章候选按全局字符�
 最小的语速序列。全部块取 150% 仍超时（或块间静音本身已超目标）即无可行
 方案。
 
+多人交叠发声报告（`crosstalk_report.py`）为事件扫描线，
+**O(n log n) 时间、O(n) 空间**（n ≤ 2000）。每个正时长词生成开始/结束
+事件，事件按 `(时刻, 类型)` 排序且同一时刻**结束事件先于开始事件**处理
+（端点相接不算同时发声）；扫描中维护每个说话人的活跃区间计数，计数 ≥ 1
+即在发声（同一说话人的重叠词只计一次），相邻事件点之间活跃集合恒定；
+保留活跃说话人 ≥ 2 的片段后仅合并相邻且集合相同者，再把每段时长累加给
+活跃集合的每个无序说话人对（三人段分别计入三对）。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -953,6 +1036,7 @@ app/
   redact_preview.py     # 敏感短语遮罩预览（纯标准库，复用同一套输入校验）
   trailer_plan.py       # 预告片片段组合（纯标准库，复用同一套输入校验）
   playback_plan.py      # 播放变速规划（纯标准库，复用同一套输入校验）
+  crosstalk_report.py   # 多人交叠发声报告（纯标准库，允许乱序与交叠的扫描线）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -964,6 +1048,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_redact_preview.py
   test_trailer_plan.py
   test_playback_plan.py
+  test_crosstalk_report.py
   test_differential.py
   test_api.py
 Dockerfile
